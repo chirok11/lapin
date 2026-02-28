@@ -167,6 +167,9 @@ impl<
         if self.connection_status.errored() {
             return false;
         }
+        if self.reconnecting() {
+            return false;
+        }
 
         trace!(status=?self.status, connection_status=?self.connection_status.state(), internal_rpc_empty=%self.internal_rpc.is_empty(), frames_pending=%self.frames.has_pending(), conn_killed=%connection_killswitch.killed(), ser_frames_empty=%self.serialized_frames.is_empty(), "Should continue?");
 
@@ -305,6 +308,12 @@ impl<
             connection_killswitch.kill();
         }
         if self.channels.can_recover(&error) {
+            if self.reconnecting() {
+                return Ok(());
+            }
+            // Flip state eagerly so the current IO loop iteration can stop immediately.
+            // Channel-level recovery initialization remains serialized through InternalRPC.
+            self.connection_status.set_reconnecting();
             self.internal_rpc.init_connection_recovery(error);
             return Ok(());
         }
@@ -345,8 +354,17 @@ impl<
         result: Result<()>,
     ) -> Result<()> {
         if let Err(e) = self.socket_state.handle_io_result(result) {
-            error!(error=?e, "error doing IO");
+            if self.reconnecting() {
+                trace!(error=?e, "IO error while reconnecting");
+            } else {
+                error!(error=?e, "error doing IO");
+            }
             self.critical_error(connection_killswitch, e)?;
+            if self.reconnecting() {
+                return Err(
+                    ErrorKind::InvalidConnectionState(ConnectionState::Reconnecting).into(),
+                );
+            }
         }
         Ok(())
     }
@@ -474,22 +492,19 @@ impl<
                         error!(
                             "Socket was readable but we read 0. This usually means that the connection is half closed, thus report it as broken."
                         );
-                        // Give a chance to parse and use frames we already read from socket before overriding the error with a custom one.
-                        if !self.handle_frames(connection_killswitch)?
-                            && self.internal_rpc.is_empty()
-                        {
-                            if self.reconnecting() || self.channels.connection_killswitch().killed()
-                            {
-                                trace!(
-                                    "We're in the process of recovering connection, quit reading socket to enter recovery"
-                                );
-                                return Ok(true);
-                            }
-                            self.socket_state.handle_io_result(Err(io::Error::from(
-                                io::ErrorKind::ConnectionAborted,
-                            )
-                            .into()))?;
+                        // Give a chance to parse and use frames we already read from socket before
+                        // overriding the error with a custom one.
+                        self.handle_frames(connection_killswitch)?;
+                        if self.reconnecting() || self.channels.connection_killswitch().killed() {
+                            trace!(
+                                "We're in the process of recovering connection, quit reading socket to enter recovery"
+                            );
+                            return Ok(true);
                         }
+                        self.socket_state.handle_io_result(Err(io::Error::from(
+                            io::ErrorKind::ConnectionAborted,
+                        )
+                        .into()))?;
                     }
                 }
                 Ok(false)
@@ -590,4 +605,171 @@ fn io_loop_span(connect_span: tracing::Span) -> tracing::Span {
     // connect operation, so we set it as a follows_from relationship.
     span.follows_from(&connect_span);
     span
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ConnectionProperties, configuration::Configuration, events::Events,
+        internal_rpc::InternalRPC, runtime, secret_update::SecretUpdate,
+    };
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    struct ZeroReadStream;
+
+    impl AsyncRead for ZeroReadStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    impl AsyncWrite for ZeroReadStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn should_stop_connected_loop_when_reconnecting() {
+        let uri = AMQPUri::default();
+        let runtime = runtime::default_runtime().expect("default runtime");
+        let configuration = Configuration::new(&uri, ConnectionProperties::default());
+        let status = ConnectionStatus::new(&uri);
+        let frames = Frames::default();
+        let socket_state = SocketState::default();
+        let heartbeat = Heartbeat::new(status.clone(), runtime.clone());
+        let secret_update = SecretUpdate::new(
+            status.clone(),
+            runtime.clone(),
+            configuration.auth_provider.clone(),
+        );
+        let internal_rpc = InternalRPC::new(
+            runtime.clone(),
+            heartbeat.clone(),
+            secret_update,
+            frames.clone(),
+            socket_state.handle(),
+        );
+        let events = Events::new();
+        let channels = Channels::new(
+            configuration.clone(),
+            status.clone(),
+            socket_state.handle(),
+            internal_rpc.handle(),
+            frames.clone(),
+            events,
+        );
+        let connect = |_uri: AMQPUri, _runtime: Runtime<_>| async move {
+            unreachable!("connect is not used in io_loop unit tests");
+        };
+        let io_loop = IoLoop::new(
+            status,
+            configuration.negotiated_config.clone(),
+            channels,
+            internal_rpc.handle(),
+            frames,
+            socket_state,
+            heartbeat,
+            runtime,
+            connect,
+            uri,
+            ExponentialBuilder::default(),
+        );
+        io_loop
+            .connection_status
+            .set_state(ConnectionState::Reconnecting);
+        let connection_killswitch = io_loop.channels.connection_killswitch();
+        assert!(!io_loop.should_continue(&connection_killswitch));
+    }
+
+    #[test]
+    fn zero_read_reports_connection_aborted_even_with_pending_internal_rpc() {
+        let uri = AMQPUri::default();
+        let runtime = runtime::default_runtime().expect("default runtime");
+        let configuration = Configuration::new(&uri, ConnectionProperties::default());
+        let status = ConnectionStatus::new(&uri);
+        let frames = Frames::default();
+        let socket_state = SocketState::default();
+        let heartbeat = Heartbeat::new(status.clone(), runtime.clone());
+        let secret_update = SecretUpdate::new(
+            status.clone(),
+            runtime.clone(),
+            configuration.auth_provider.clone(),
+        );
+        let internal_rpc = InternalRPC::new(
+            runtime.clone(),
+            heartbeat.clone(),
+            secret_update,
+            frames.clone(),
+            socket_state.handle(),
+        );
+        let events = Events::new();
+        let channels = Channels::new(
+            configuration.clone(),
+            status.clone(),
+            socket_state.handle(),
+            internal_rpc.handle(),
+            frames.clone(),
+            events,
+        );
+        let connect = |_uri: AMQPUri, _runtime: Runtime<_>| async move {
+            unreachable!("connect is not used in io_loop unit tests");
+        };
+        let mut io_loop = IoLoop::new(
+            status,
+            configuration.negotiated_config.clone(),
+            channels,
+            internal_rpc.handle(),
+            frames,
+            socket_state,
+            heartbeat,
+            runtime,
+            connect,
+            uri,
+            ExponentialBuilder::default(),
+        );
+        io_loop
+            .connection_status
+            .set_state(ConnectionState::Connected);
+        io_loop.internal_rpc.send_heartbeat();
+        assert!(!io_loop.internal_rpc.is_empty());
+
+        let mut stream = ZeroReadStream;
+        let readable_waker = io_loop.socket_state.readable_waker();
+        let mut readable_context = Context::from_waker(&readable_waker);
+        let connection_killswitch = io_loop.channels.connection_killswitch();
+        let res = io_loop.read_from_stream(
+            Pin::new(&mut stream),
+            &mut readable_context,
+            &connection_killswitch,
+        );
+
+        assert!(res.is_err());
+        let err = res.expect_err("expected a connection aborted error");
+        assert!(matches!(
+            err.kind(),
+            ErrorKind::IOError(io_err) if io_err.kind() == io::ErrorKind::ConnectionAborted
+        ));
+    }
 }
